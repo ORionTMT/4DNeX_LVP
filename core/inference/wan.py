@@ -34,6 +34,7 @@ def generate_video(
     height: Optional[int] = None,
     output_path: str = "./output.mp4",
     image_or_video_path: str = "",
+    xyz_image_path: Optional[str] = None,
     num_inference_steps: int = 50,
     guidance_scale: float = 5.0,
     num_videos_per_prompt: int = 1,
@@ -42,6 +43,7 @@ def generate_video(
     seed: int = 42,
     fps: int = 16,
     mode: str = 'xyz',
+    pointmap_mask_value: float = 1.0,
 ):
     """
     Generates a video based on the given prompt and saves it to the specified path.
@@ -104,21 +106,35 @@ def generate_video(
         from core.finetune.models.wan_i2v.demb_samerope_trainer import WanSameRopeWBWImageToVideoPipeline
         pipe = WanSameRopeWBWImageToVideoPipeline.from_pretrained(model_path, image_encoder=image_encoder, transformer=transformer, torch_dtype=dtype)
         image = load_image(image=image_or_video_path)
+        pipe.pointmap_mask_value = float(pointmap_mask_value)
     else:
         raise NotImplementedError
 
-    max_area = 480 * 720
-    aspect_ratio = image.height / image.width
     mod_value = pipe.vae_scale_factor_spatial * pipe.transformer.config.patch_size[1]
-    height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
-    width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
-    image = image.resize((width, height))
+    if width is None or height is None:
+        max_area = 480 * 720
+        aspect_ratio = image.height / image.width
+        height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+        width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+    else:
+        height = height // mod_value * mod_value
+        width = width // mod_value * mod_value
+    if image is not None:
+        image = image.resize((width, height))
+
+    if xyz_image_path and hasattr(pipe, "video_processor"):
+        pointmap_image = load_image(image=xyz_image_path)
+        pointmap_image = pointmap_image.resize((width, height))
+        pointmap_tensor = pipe.video_processor.preprocess(pointmap_image, height=height, width=width)
+        setattr(pipe, "pointmap_image", pointmap_tensor)
+    elif hasattr(pipe, "pointmap_image"):
+        setattr(pipe, "pointmap_image", None)
         
     # If you're using with lora, add this code
     if lora_path:
         print('loading lora')
         pipe.load_lora_weights(lora_path, weight_name="pytorch_lora_weights.safetensors")
-        pipe.fuse_lora(components=["transformer"], lora_scale=0.5)
+        pipe.fuse_lora(components=["transformer"], lora_scale=1.01)
 
     pipe.to("cuda")
 

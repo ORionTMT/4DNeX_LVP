@@ -230,6 +230,12 @@ class WanI2VSftTrainer(Trainer):
         prompt_embedding = self.components.text_encoder(prompt_token_ids.to(self.accelerator.device))[0]
         return prompt_embedding
 
+    def encode_image(self, image: Image.Image) -> torch.Tensor:
+        image_inputs = self.components.image_processor(images=image, return_tensors="pt").to(self.accelerator.device)
+        with torch.no_grad():
+            image_embeds = self.components.image_encoder(**image_inputs, output_hidden_states=True)
+        return image_embeds.hidden_states[-2]
+
     @override
     def collate_fn(self, samples: List[Dict[str, Any]]) -> Dict[str, Any]:
         ret = {"encoded_videos": [], "prompt_embedding": [], "images": [], "image_embedding": []}
@@ -263,10 +269,11 @@ class WanI2VSftTrainer(Trainer):
 
     @override
     def compute_loss(self, batch) -> torch.Tensor:
-        prompt_embedding = batch["prompt_embedding"].to(self.components.transformer.dtype)
-        latent = batch["encoded_videos"].to(self.components.transformer.dtype)
+        transformer_dtype = self.get_transformer_dtype()
+        prompt_embedding = batch["prompt_embedding"].to(transformer_dtype)
+        latent = batch["encoded_videos"].to(transformer_dtype)
         images = batch["images"]
-        image_embedding = batch["image_embedding"].to(self.components.transformer.dtype)
+        image_embedding = batch["image_embedding"].to(transformer_dtype)
         # Shape of prompt_embedding: [B, seq_len, hidden_size] -> [B, 512, 4096]
         # Shape of latent: [B, C, F, H, W] -> [B, 16, 21 (if 81 frames), latent_H, latent_W]
         # Shape of images: [B, C, H, W]

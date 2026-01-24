@@ -134,6 +134,15 @@ class Trainer:
             self.args.output_dir = Path(self.args.output_dir)
             self.args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    def get_transformer_dtype(self) -> torch.dtype:
+        transformer = self.components.transformer
+        transformer_dtype = getattr(transformer, "dtype", None)
+        if transformer_dtype is not None:
+            return transformer_dtype
+        for param in transformer.parameters():
+            return param.dtype
+        return self.state.weight_dtype
+
     def check_setting(self) -> None:
         # Check for unload_list
         if self.UNLOAD_LIST is None:
@@ -171,32 +180,37 @@ class Trainer:
         else:
             raise ValueError(f"Invalid model type: {self.args.model_type}")
 
-        # Prepare VAE and text encoder for encoding
-        self.components.vae.requires_grad_(False)
-        self.components.text_encoder.requires_grad_(False)
-        self.components.vae = self.components.vae.to(self.accelerator.device, dtype=self.state.weight_dtype)
-        self.components.text_encoder = self.components.text_encoder.to(
-            self.accelerator.device, dtype=self.state.weight_dtype
-        )
+        if self.args.raw_data:
+            if self.args.num_workers != 0:
+                logger.warning("raw_data is enabled; forcing num_workers=0 for on-the-fly encoding.")
+                self.args.num_workers = 0
+        else:
+            # Prepare VAE and text encoder for encoding
+            self.components.vae.requires_grad_(False)
+            self.components.text_encoder.requires_grad_(False)
+            self.components.vae = self.components.vae.to(self.accelerator.device, dtype=self.state.weight_dtype)
+            self.components.text_encoder = self.components.text_encoder.to(
+                self.accelerator.device, dtype=self.state.weight_dtype
+            )
 
-        # Precompute latent for video and prompt embedding
-        logger.info("Precomputing latent for video and prompt embedding ...")
-        tmp_data_loader = torch.utils.data.DataLoader(
-            self.dataset,
-            collate_fn=self.collate_fn,
-            batch_size=1,
-            num_workers=0,
-            pin_memory=self.args.pin_memory,
-        )
-        tmp_data_loader = self.accelerator.prepare_data_loader(tmp_data_loader)
-        for _ in tmp_data_loader:
-            ...
-        self.accelerator.wait_for_everyone()
-        logger.info("Precomputing latent for video and prompt embedding ... Done")
+            # Precompute latent for video and prompt embedding
+            logger.info("Precomputing latent for video and prompt embedding ...")
+            tmp_data_loader = torch.utils.data.DataLoader(
+                self.dataset,
+                collate_fn=self.collate_fn,
+                batch_size=1,
+                num_workers=0,
+                pin_memory=self.args.pin_memory,
+            )
+            tmp_data_loader = self.accelerator.prepare_data_loader(tmp_data_loader)
+            for _ in tmp_data_loader:
+                ...
+            self.accelerator.wait_for_everyone()
+            logger.info("Precomputing latent for video and prompt embedding ... Done")
 
-        unload_model(self.components.vae)
-        unload_model(self.components.text_encoder)
-        free_memory()
+            unload_model(self.components.vae)
+            unload_model(self.components.text_encoder)
+            free_memory()
 
         self.data_loader = torch.utils.data.DataLoader(
             self.dataset,
@@ -238,6 +252,29 @@ class Trainer:
             )
             self.components.transformer.add_adapter(transformer_lora_config)
             self.__prepare_saving_loading_hooks(transformer_lora_config)
+            if self.args.init_lora_path:
+                lora_state_dict = self.components.pipeline_cls.lora_state_dict(self.args.init_lora_path)
+                transformer_state_dict = {
+                    k.replace("transformer.", ""): v
+                    for k, v in lora_state_dict.items()
+                    if k.startswith("transformer.")
+                }
+                incompatible_keys = set_peft_model_state_dict(
+                    self.components.transformer, transformer_state_dict, adapter_name="default"
+                )
+                if incompatible_keys is not None:
+                    unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
+                    if unexpected_keys:
+                        logger.warning(
+                            f"Initializing LoRA from state_dict had unexpected keys: {unexpected_keys}"
+                        )
+                init_embeddings_path = Path(self.args.init_lora_path) / "learnable_domain_embeddings.pt"
+                if init_embeddings_path.exists():
+                    learnable_embeddings = torch.load(init_embeddings_path, map_location="cpu")
+                    param = getattr(self.components.transformer, "learnable_domain_embeddings", None)
+                    if param is not None:
+                        param.data = learnable_embeddings.to(param.device, param.dtype)
+                        logger.info(f"Loaded learnable_domain_embeddings from {init_embeddings_path}")
             for name, param in self.components.transformer.named_parameters():
                 if 'learnable_domain_embeddings' in name:
                     param.requires_grad_(True)
@@ -245,6 +282,8 @@ class Trainer:
 
         # Load components needed for training to GPU (except transformer), and cast them to the specified data type
         ignore_list = ["transformer"] + self.UNLOAD_LIST
+        if self.args.raw_data:
+            ignore_list = [name for name in ignore_list if name not in ("text_encoder", "image_encoder")]
         self.__move_components_to_device(dtype=weight_dtype, ignore_list=ignore_list)
 
         if self.args.gradient_checkpointing:
@@ -342,9 +381,15 @@ class Trainer:
         else:
             validation_videos = [None] * len(validation_prompts)
 
+        if self.args.validation_xyz_images is not None:
+            validation_xyz_images = load_images(self.args.validation_dir / self.args.validation_xyz_images)
+        else:
+            validation_xyz_images = [None] * len(validation_prompts)
+
         self.state.validation_prompts = validation_prompts
         self.state.validation_images = validation_images
         self.state.validation_videos = validation_videos
+        self.state.validation_xyz_images = validation_xyz_images
 
     def prepare_trackers(self) -> None:
         logger.info("Initializing trackers")
@@ -521,6 +566,7 @@ class Trainer:
             prompt = self.state.validation_prompts[i]
             image = self.state.validation_images[i]
             video = self.state.validation_videos[i]
+            xyz_image = self.state.validation_xyz_images[i] if self.state.validation_xyz_images else None
 
             if image is not None:
                 image = preprocess_image_with_resize(image, self.state.train_height, self.state.train_width)
@@ -541,7 +587,9 @@ class Trainer:
                 f"Validating sample {i + 1}/{num_validation_samples} on process {accelerator.process_index}. Prompt: {prompt}",
                 main_process_only=False,
             )
-            validation_artifacts = self.validation_step({"prompt": prompt, "image": image, "video": video}, pipe)
+            validation_artifacts = self.validation_step(
+                {"prompt": prompt, "image": image, "video": video, "xyz_image": xyz_image}, pipe
+            )
 
             if (
                 self.state.using_deepspeed
@@ -609,6 +657,9 @@ class Trainer:
             del pipe
             # Unload models except those needed for training
             self.__move_components_to_cpu(unload_list=self.UNLOAD_LIST)
+            if self.args.raw_data:
+                # Raw data path encodes text/images on-the-fly, keep encoders on device.
+                self.__move_components_to_device(dtype=self.state.weight_dtype, ignore_list=["transformer"])
         else:
             pipe.remove_all_hooks()
             del pipe
@@ -622,6 +673,13 @@ class Trainer:
         free_memory()
         accelerator.wait_for_everyone()
         ################################
+
+        if hasattr(self.components.scheduler, "set_timesteps"):
+            # Validation modifies scheduler timesteps for inference; restore full training schedule.
+            self.components.scheduler.set_timesteps(
+                self.components.scheduler.config.num_train_timesteps,
+                device=self.accelerator.device,
+            )
 
         memory_statistics = get_memory_statistics()
         logger.info(f"Memory after validation end: {json.dumps(memory_statistics, indent=4)}")
@@ -637,7 +695,7 @@ class Trainer:
         self.prepare_trainable_parameters()
         self.prepare_optimizer()
         self.prepare_for_training()
-        if self.args.do_validation:
+        if self.args.do_validation or self.args.checkpoint_validation:
             self.prepare_for_validation()
         self.prepare_trackers()
         self.train()
@@ -697,6 +755,7 @@ class Trainer:
         def save_model_hook(models, weights, output_dir):
             if self.accelerator.is_main_process:
                 transformer_lora_layers_to_save = None
+                transformer_to_save = None
 
                 for model in models:
                     if isinstance(
@@ -704,6 +763,7 @@ class Trainer:
                         type(unwrap_model(self.accelerator, self.components.transformer)),
                     ):
                         model = unwrap_model(self.accelerator, model)
+                        transformer_to_save = model
                         transformer_lora_layers_to_save = get_peft_model_state_dict(model)
                     else:
                         raise ValueError(f"Unexpected save model: {model.__class__}")
@@ -716,6 +776,11 @@ class Trainer:
                     output_dir,
                     transformer_lora_layers=transformer_lora_layers_to_save,
                 )
+                if transformer_to_save is not None:
+                    learnable_embeddings = getattr(transformer_to_save, "learnable_domain_embeddings", None)
+                    if learnable_embeddings is not None:
+                        output_path = Path(output_dir) / "learnable_domain_embeddings.pt"
+                        torch.save(learnable_embeddings.detach().cpu(), output_path)
 
         def load_model_hook(models, input_dir):
             if not self.accelerator.distributed_type == DistributedType.DEEPSPEED:
@@ -753,7 +818,93 @@ class Trainer:
         self.accelerator.register_save_state_pre_hook(save_model_hook)
         self.accelerator.register_load_state_pre_hook(load_model_hook)
 
+    def __checkpoint_validate(self, step: int, output_dir: Path) -> None:
+        if not self.accelerator.is_main_process:
+            return
+
+        num_validation_samples = len(self.state.validation_prompts)
+        if num_validation_samples == 0:
+            logger.warning("No checkpoint validation samples found. Skipping.")
+            return
+
+        if self.state.using_deepspeed and self.accelerator.deepspeed_plugin.zero_stage == 3:
+            logger.warning("Checkpoint validation skipped for ZeRO-3.")
+            return
+
+        self.components.transformer.eval()
+        torch.set_grad_enabled(False)
+
+        pipe = self.initialize_pipeline()
+        if self.state.using_deepspeed:
+            self.__move_components_to_device(dtype=self.state.weight_dtype, ignore_list=["transformer"])
+            pipe = pipe.to(self.accelerator.device, dtype=self.state.weight_dtype)
+        else:
+            pipe.enable_model_cpu_offload(device=self.accelerator.device)
+            pipe = pipe.to(dtype=self.state.weight_dtype)
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        for i in range(num_validation_samples):
+            prompt = self.state.validation_prompts[i]
+            image = self.state.validation_images[i]
+            video = self.state.validation_videos[i]
+            xyz_image = self.state.validation_xyz_images[i] if self.state.validation_xyz_images else None
+
+            if image is not None:
+                image = preprocess_image_with_resize(image, self.state.train_height, self.state.train_width)
+                image = image.to(torch.uint8)
+                image = image.permute(1, 2, 0).cpu().numpy()
+                image = Image.fromarray(image)
+
+            if video is not None:
+                video = preprocess_video_with_resize(
+                    video, self.state.train_frames, self.state.train_height, self.state.train_width
+                )
+                video = video.round().clamp(0, 255).to(torch.uint8)
+                video = [Image.fromarray(frame.permute(1, 2, 0).cpu().numpy()) for frame in video]
+
+            validation_artifacts = self.validation_step(
+                {"prompt": prompt, "image": image, "video": video, "xyz_image": xyz_image}, pipe
+            )
+
+            prompt_filename = string_to_filename(prompt)[:25]
+            reversed_prompt = prompt[::-1]
+            hash_suffix = hashlib.md5(reversed_prompt.encode()).hexdigest()[:5]
+
+            for j, (artifact_type, artifact_value) in enumerate(validation_artifacts):
+                if artifact_type not in ["image", "video"] or artifact_value is None:
+                    continue
+                extension = "png" if artifact_type == "image" else "mp4"
+                filename = f"validation-{step}-{i}-{j}-{prompt_filename}-{hash_suffix}.{extension}"
+                filename = str(output_dir / filename)
+                if artifact_type == "image":
+                    artifact_value.save(filename)
+                elif artifact_type == "video":
+                    export_to_video(artifact_value, filename, fps=self.args.gen_fps)
+
+        if self.state.using_deepspeed:
+            del pipe
+            self.__move_components_to_cpu(unload_list=self.UNLOAD_LIST)
+            if self.args.raw_data:
+                # Raw data path encodes text/images on-the-fly, keep encoders on device.
+                self.__move_components_to_device(dtype=self.state.weight_dtype, ignore_list=["transformer"])
+        else:
+            del pipe
+            free_memory()
+
+        if hasattr(self.components.scheduler, "set_timesteps"):
+            # Validation modifies scheduler timesteps for inference; restore full training schedule.
+            self.components.scheduler.set_timesteps(
+                self.components.scheduler.config.num_train_timesteps,
+                device=self.accelerator.device,
+            )
+
+        torch.set_grad_enabled(True)
+        self.components.transformer.train()
+
     def __maybe_save_checkpoint(self, global_step: int, must_save: bool = False):
+        if getattr(self.args, "dummy_data", False):
+            return
         if self.accelerator.distributed_type == DistributedType.DEEPSPEED or self.accelerator.is_main_process:
             if must_save or global_step % self.args.checkpointing_steps == 0:
                 # for training
@@ -763,3 +914,6 @@ class Trainer:
                     output_dir=self.args.output_dir,
                 )
                 self.accelerator.save_state(save_path, safe_serialization=True)
+                if self.args.checkpoint_validation:
+                    self.accelerator.wait_for_everyone()
+                    self.__checkpoint_validate(global_step, Path(save_path) / "validation")

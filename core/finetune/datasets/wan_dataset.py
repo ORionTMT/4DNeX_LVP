@@ -10,11 +10,12 @@ from torchvision import transforms
 from typing_extensions import override
 import PIL
 
-from core.finetune.constants import LOG_LEVEL, LOG_NAME
+from core.finetune.constants import ENCODED_PM_MEAN, ENCODED_PM_STD, LOG_LEVEL, LOG_NAME
 
 from .utils import (
     load_images,
     load_images_from_videos,
+    load_raw_metadata,
     load_prompts,
     load_videos,
     preprocess_image_with_resize,
@@ -64,24 +65,71 @@ class BaseWanDataset(Dataset):
     ) -> None:
         super().__init__()
 
-        data_root = Path(data_root)
-        self.prompts = load_prompts(data_root / caption_column)
-        self.videos = load_videos(data_root / video_column)
-        if image_column is not None:
-            self.images = load_images(data_root / image_column)
-        else:
-            self.images = load_images_from_videos(self.videos)
         self.trainer = trainer
-
         self.device = device
         self.encode_video = trainer.encode_video
         self.encode_text = trainer.encode_text
+        self.encode_image = getattr(trainer, "encode_image", None)
+        self._dummy_data = bool(trainer and getattr(trainer.args, "dummy_data", False))
+        self._raw_data = bool(trainer and getattr(trainer.args, "raw_data", False))
+        self._raw_samples: List[Dict[str, Any]] = []
+        if self._dummy_data:
+            self._dummy_num_samples = max(1, int(getattr(trainer.args, "dummy_num_samples", 8)))
+            self.prompts = ["dummy prompt"] * self._dummy_num_samples
+            self.videos = [Path(f"dummy_{i}.mp4") for i in range(self._dummy_num_samples)]
+            self.images = [Path(f"dummy_{i}.png") for i in range(self._dummy_num_samples)]
+        else:
+            data_root = Path(data_root)
+            if self._raw_data and getattr(self.trainer.args, "raw_metadata", None):
+                raw_metadata_path = Path(self.trainer.args.raw_metadata)
+                if not raw_metadata_path.is_absolute():
+                    # Prefer explicit path if it exists relative to cwd, otherwise resolve under data_root.
+                    if not raw_metadata_path.exists():
+                        raw_metadata_path = data_root / raw_metadata_path
+                self._raw_samples = load_raw_metadata(raw_metadata_path)
+                self.prompts = [sample["caption"] for sample in self._raw_samples]
+                self.videos = [self._resolve_sample_path(data_root, sample["rgb_video_path"]) for sample in self._raw_samples]
+                self.pointmap_videos = [
+                    self._resolve_sample_path(data_root, sample["xyz_video_path"]) for sample in self._raw_samples
+                ]
+                self.images = []
+            else:
+                self.prompts = load_prompts(data_root / caption_column)
+                self.videos = load_videos(data_root / video_column)
+                if self._raw_data:
+                    pointmap_column = getattr(self.trainer.args, "pointmap_column", None)
+                    if pointmap_column is None:
+                        raise ValueError("pointmap_column must be specified when raw_data is enabled")
+                    self.pointmap_videos = load_videos(data_root / pointmap_column)
+                    self.images = []
+                elif image_column is not None:
+                    self.images = load_images(data_root / image_column)
+                else:
+                    self.images = load_images_from_videos(self.videos)
 
-        uniform_pointmap = torch.from_numpy(generate_uniform_pointmap(self.trainer.args.train_resolution[1], self.trainer.args.train_resolution[2])).permute(2, 0, 1)
+        uniform_pointmap = torch.from_numpy(
+            generate_uniform_pointmap(self.trainer.args.train_resolution[1], self.trainer.args.train_resolution[2])
+        ).permute(2, 0, 1)
         self.uniform_pointmap = uniform_pointmap * 2 - 1
+        self.use_xyz_first_frame = getattr(self.trainer.args, "use_xyz_first_frame", False)
+        self.encoded_pm_mean = ENCODED_PM_MEAN
+        self.encoded_pm_std = ENCODED_PM_STD
+        self.log_data_paths = getattr(self.trainer.args, "log_data_paths", False)
+        self.log_data_paths_limit = getattr(self.trainer.args, "log_data_paths_limit", 10)
+        self._log_data_paths_count = 0
+
+        if self._dummy_data:
+            self._dummy_shapes = self._compute_dummy_shapes()
+            return
 
         # Check if number of prompts matches number of videos and images
-        if not (len(self.videos) == len(self.prompts) == len(self.images)):
+        if self._raw_data:
+            if not (len(self.videos) == len(self.prompts) == len(self.pointmap_videos)):
+                raise ValueError(
+                    "Expected length of prompts, rgb videos and pointmap videos to be the same but found "
+                    f"{len(self.prompts)}, {len(self.videos)} and {len(self.pointmap_videos)}."
+                )
+        elif not (len(self.videos) == len(self.prompts) == len(self.images)):
             raise ValueError(
                 f"Expected length of prompts, videos and images to be the same but found {len(self.prompts)}, {len(self.videos)} and {len(self.images)}. Please ensure that the number of caption prompts, videos and images match in your dataset."
             )
@@ -92,16 +140,27 @@ class BaseWanDataset(Dataset):
                 f"Some video files were not found. Please ensure that all video files exist in the dataset directory. Missing file: {next(path for path in self.videos if not path.is_file())}"
             )
 
-        # Check if all image files exist
-        if any(not path.is_file() for path in self.images):
-            raise ValueError(
-                f"Some image files were not found. Please ensure that all image files exist in the dataset directory. Missing file: {next(path for path in self.images if not path.is_file())}"
-            )
+        if self._raw_data:
+            if any(not path.is_file() for path in self.pointmap_videos):
+                raise ValueError(
+                    "Some pointmap video files were not found. Please ensure that all pointmap video files exist in the dataset directory. "
+                    f"Missing file: {next(path for path in self.pointmap_videos if not path.is_file())}"
+                )
+        else:
+            # Check if all image files exist
+            if any(not path.is_file() for path in self.images):
+                raise ValueError(
+                    f"Some image files were not found. Please ensure that all image files exist in the dataset directory. Missing file: {next(path for path in self.images if not path.is_file())}"
+                )
 
     def __len__(self) -> int:
         return len(self.videos)
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
+        if self._dummy_data:
+            return self._dummy_getitem(index)
+        if self._raw_data:
+            return self._raw_getitem(index)
         while True:
             try:
                 ret = self.getitem(index)
@@ -112,6 +171,186 @@ class BaseWanDataset(Dataset):
                 # print(e)
                 index = (index + 1) % len(self.videos)
         return ret
+
+    def _compute_dummy_shapes(self) -> Dict[str, int]:
+        frames, height, width = self.trainer.args.train_resolution
+        vae_config = self.trainer.components.vae.config
+        temporal_downsample = getattr(vae_config, "temperal_downsample", None)
+        if temporal_downsample is None:
+            vae_scale_factor_temporal = 4
+        else:
+            vae_scale_factor_temporal = 2 ** sum(1 for v in temporal_downsample if v)
+
+        dim_mult = getattr(vae_config, "dim_mult", None)
+        if dim_mult:
+            vae_scale_factor_spatial = 2 ** (len(dim_mult) - 1)
+        else:
+            vae_scale_factor_spatial = 8
+
+        num_latent_frames = (frames - 1) // vae_scale_factor_temporal + 1
+        num_latent_frames = min(num_latent_frames, 13)
+        latent_height = height // vae_scale_factor_spatial
+        latent_width = width * 2 // vae_scale_factor_spatial
+
+        num_channels_latents = int(getattr(vae_config, "z_dim", 16))
+
+        text_config = self.trainer.components.text_encoder.config
+        text_hidden_size = int(getattr(text_config, "d_model", getattr(text_config, "hidden_size", 4096)))
+        prompt_seq_len = 512
+
+        image_config = self.trainer.components.image_encoder.config
+        image_hidden_size = int(getattr(image_config, "hidden_size", 1280))
+        image_size = getattr(image_config, "image_size", 224)
+        if isinstance(image_size, (list, tuple)):
+            image_size = image_size[0]
+        patch_size = getattr(image_config, "patch_size", 14)
+        if isinstance(patch_size, (list, tuple)):
+            patch_size = patch_size[0]
+        if patch_size <= 0:
+            patch_size = 14
+        num_image_tokens = (image_size // patch_size) ** 2 + 1
+
+        return {
+            "frames": frames,
+            "height": height,
+            "width": width,
+            "latent_channels": num_channels_latents,
+            "latent_frames": num_latent_frames,
+            "latent_height": latent_height,
+            "latent_width": latent_width,
+            "prompt_seq_len": prompt_seq_len,
+            "text_hidden_size": text_hidden_size,
+            "image_seq_len": num_image_tokens,
+            "image_hidden_size": image_hidden_size,
+        }
+
+    def _dummy_getitem(self, index: int) -> Dict[str, Any]:
+        shapes = self._dummy_shapes
+        encoded_video = torch.randn(
+            shapes["latent_channels"],
+            shapes["latent_frames"],
+            shapes["latent_height"],
+            shapes["latent_width"],
+        )
+        prompt_embedding = torch.randn(shapes["prompt_seq_len"], shapes["text_hidden_size"])
+        image_embedding = torch.randn(shapes["image_seq_len"], shapes["image_hidden_size"])
+
+        image = torch.rand(3, shapes["height"], shapes["width"]) * 2 - 1
+        if self.use_xyz_first_frame:
+            image_pm = torch.rand(3, shapes["height"], shapes["width"]) * 2 - 1
+            image = torch.concat([image, image_pm], dim=-1)
+        else:
+            image = torch.concat([image, self.uniform_pointmap], dim=-1)
+
+        return {
+            "image": image,
+            "prompt_embedding": prompt_embedding,
+            "encoded_video": encoded_video,
+            "image_embedding": image_embedding,
+            "video_metadata": {
+                "num_frames": shapes["latent_frames"],
+                "height": shapes["latent_height"],
+                "width": shapes["latent_width"],
+            },
+        }
+
+    def _resolve_sample_path(self, base_dir: Path, path_str: str) -> Path:
+        path = Path(path_str)
+        if not path.is_absolute():
+            path = base_dir / path
+        return path
+
+    def _raw_getitem(self, index: int) -> Dict[str, Any]:
+        if self.encode_image is None:
+            raise RuntimeError("encode_image is not available for raw_data mode")
+
+        if self._raw_samples:
+            sample = self._raw_samples[index]
+            prompt = sample["caption"]
+            video = self.videos[index]
+            pointmap_video = self.pointmap_videos[index]
+        else:
+            prompt = self.prompts[index]
+            video = self.videos[index]
+            pointmap_video = self.pointmap_videos[index]
+        if (
+            self.log_data_paths
+            and self._log_data_paths_count < self.log_data_paths_limit
+            and self.trainer.accelerator.is_main_process
+        ):
+            logger.info(f"raw sample {index}: rgb={video} xyz={pointmap_video}")
+            self._log_data_paths_count += 1
+
+        # HACK: add suffix prompt
+        suffix = "POINTMAP_STYLE."
+        prompt = prompt + " " + suffix
+
+        cache_dir = self.trainer.args.data_root / "cache"
+        prompt_embeddings_dir = cache_dir / "prompt_embeddings"
+        prompt_embeddings_dir.mkdir(parents=True, exist_ok=True)
+
+        prompt_hash = str(hashlib.sha256(prompt.encode()).hexdigest())
+        prompt_embedding_path = prompt_embeddings_dir / (prompt_hash + ".safetensors")
+
+        if prompt_embedding_path.exists():
+            prompt_embedding = load_file(prompt_embedding_path)["prompt_embedding"]
+        else:
+            with torch.no_grad():
+                prompt_embedding = self.encode_text(prompt)
+            prompt_embedding_cpu = prompt_embedding[0].to("cpu")
+            save_file({"prompt_embedding": prompt_embedding_cpu}, prompt_embedding_path)
+            prompt_embedding = prompt_embedding_cpu
+
+        # Load raw videos and normalize to [-1, 1]
+        frames_rgb, _ = self.preprocess(video, None)
+        if frames_rgb is None:
+            raise RuntimeError(f"Failed to load rgb video: {video}")
+        first_frame_tensor = frames_rgb[0]
+        frames_rgb = self.video_transform(frames_rgb)
+        rgb_video = frames_rgb.permute(1, 0, 2, 3).unsqueeze(0)
+
+        frames_pm, _ = self.preprocess(pointmap_video, None)
+        if frames_pm is None:
+            raise RuntimeError(f"Failed to load xyz video: {pointmap_video}")
+        first_frame_pm = frames_pm[0]
+        frames_pm = self.video_transform(frames_pm)
+        pm_video = frames_pm.permute(1, 0, 2, 3).unsqueeze(0)
+
+        with torch.no_grad():
+            encoded_video = self.encode_video(rgb_video)[0]
+            encoded_pm = self.encode_video(pm_video)[0]
+
+        # Encode first frame to image embedding
+        first_frame_pil = first_frame_tensor.permute(1, 2, 0).cpu().numpy()
+        first_frame_pil = first_frame_pil.clip(0, 255).astype("uint8")
+        first_frame_pil = PIL.Image.fromarray(first_frame_pil, mode="RGB")
+        with torch.no_grad():
+            image_embedding = self.encode_image(first_frame_pil)[0].to("cpu")
+
+        image = self.image_transform(first_frame_tensor)
+        if self.use_xyz_first_frame:
+            image_pm = self.image_transform(first_frame_pm)
+            image = torch.concat([image, image_pm], -1)
+        else:
+            image = torch.concat([image, self.uniform_pointmap], -1)
+
+        encoded_pm = (encoded_pm - self.encoded_pm_mean) / self.encoded_pm_std
+
+        # HACK: train on the first 49 frames
+        encoded_video = torch.concat([encoded_video[:, :13, :, :], encoded_pm[:, :13, :, :]], -1)
+        encoded_video = encoded_video.to("cpu")
+
+        return {
+            "image": image,
+            "prompt_embedding": prompt_embedding,
+            "encoded_video": encoded_video,
+            "image_embedding": image_embedding,
+            "video_metadata": {
+                "num_frames": encoded_video.shape[1],
+                "height": encoded_video.shape[2],
+                "width": encoded_video.shape[3],
+            },
+        }
 
     def getitem(self, index: int) -> Dict[str, Any]:
         if isinstance(index, list):
@@ -177,9 +416,7 @@ class BaseWanDataset(Dataset):
         _, image = self.preprocess(None, self.images[index])    # resize image
         image = self.image_transform(image)
 
-        encoded_pm_mean = -0.13
-        encoded_pm_std = 1.70
-        encoded_pm = (encoded_pm - encoded_pm_mean) / encoded_pm_std
+        encoded_pm = (encoded_pm - self.encoded_pm_mean) / self.encoded_pm_std
         # HACK: train on the first 49 frames
         encoded_video = torch.concat([encoded_video[:, :13, :, :], encoded_pm[:, :13, :, :]], -1)
         image = torch.concat([image, self.uniform_pointmap], -1)

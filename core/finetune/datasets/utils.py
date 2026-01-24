@@ -1,6 +1,7 @@
+import json
 import logging
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import cv2
 import torch
@@ -86,6 +87,17 @@ def load_images_from_videos(videos_path: List[Path]) -> List[Path]:
         first_frame_paths.append(frame_path)
 
     return first_frame_paths
+
+
+def load_raw_metadata(metadata_path: Path) -> List[Dict[str, Any]]:
+    samples: List[Dict[str, Any]] = []
+    with open(metadata_path, "r", encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if not line:
+                continue
+            samples.append(json.loads(line))
+    return samples
 
 
 ##########  preprocessors  ##########

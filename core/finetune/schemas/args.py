@@ -24,9 +24,18 @@ class Args(BaseModel):
     caption_column: Path
     image_column: Path | None = None
     video_column: Path
+    pointmap_column: Path | None = None
+    raw_metadata: Path | None = None
+    raw_data: bool = False
+    dummy_data: bool = False
+    dummy_num_samples: int = 8
+    use_xyz_first_frame: bool = False
+    log_data_paths: bool = False
+    log_data_paths_limit: int = 10
 
     ########## Training #########
     resume_from_checkpoint: Path | None = None
+    init_lora_path: Path | None = None
 
     seed: int | None = None
     train_epochs: int
@@ -65,6 +74,7 @@ class Args(BaseModel):
 
     num_workers: int = 8
     pin_memory: bool = True
+    xyz_loss_weight: float = 1.0
 
     gradient_checkpointing: bool = True
     enable_slicing: bool = True
@@ -78,11 +88,13 @@ class Args(BaseModel):
 
     ########## Validation ##########
     do_validation: bool = False
+    checkpoint_validation: bool = False
     validation_steps: int | None  # if set, should be a multiple of checkpointing_steps
     validation_dir: Path | None  # if set do_validation, should not be None
     validation_prompts: str | None  # if set do_validation, should not be None
     validation_images: str | None  # if set do_validation and model_type == i2v, should not be None
     validation_videos: str | None  # if set do_validation and model_type == v2v, should not be None
+    validation_xyz_images: str | None  # optional xyz image list for i2v validation
     gen_fps: int = 15
 
     #### deprecated args: gen_video_resolution
@@ -106,7 +118,7 @@ class Args(BaseModel):
     @field_validator("validation_dir", "validation_prompts")
     def validate_validation_required_fields(cls, v: Any, info: ValidationInfo) -> Any:
         values = info.data
-        if values.get("do_validation") and not v:
+        if (values.get("do_validation") or values.get("checkpoint_validation")) and not v:
             field_name = info.field_name
             raise ValueError(f"{field_name} must be specified when do_validation is True")
         return v
@@ -114,14 +126,22 @@ class Args(BaseModel):
     @field_validator("validation_images")
     def validate_validation_images(cls, v: str | None, info: ValidationInfo) -> str | None:
         values = info.data
-        if values.get("do_validation") and values.get("model_type") in ["i2v", "i2pm", "i2dpm"] and not v:
+        if (
+            (values.get("do_validation") or values.get("checkpoint_validation"))
+            and values.get("model_type") in ["i2v", "i2pm", "i2dpm"]
+            and not v
+        ):
             raise ValueError("validation_images must be specified when do_validation is True and model_type is i2v")
         return v
 
     @field_validator("validation_videos")
     def validate_validation_videos(cls, v: str | None, info: ValidationInfo) -> str | None:
         values = info.data
-        if values.get("do_validation") and values.get("model_type") == "v2v" and not v:
+        if (
+            (values.get("do_validation") or values.get("checkpoint_validation"))
+            and values.get("model_type") == "v2v"
+            and not v
+        ):
             raise ValueError("validation_videos must be specified when do_validation is True and model_type is v2v")
         return v
 
@@ -179,9 +199,11 @@ class Args(BaseModel):
         parser.add_argument("--model_type", type=str, required=True)
         parser.add_argument("--training_type", type=str, required=True)
         parser.add_argument("--output_dir", type=str, required=True)
-        parser.add_argument("--data_root", type=str, required=True)
-        parser.add_argument("--caption_column", type=str, required=True)
-        parser.add_argument("--video_column", type=str, required=True)
+        parser.add_argument("--data_root", type=str, required=False)
+        parser.add_argument("--caption_column", type=str, required=False)
+        parser.add_argument("--video_column", type=str, required=False)
+        parser.add_argument("--pointmap_column", type=str, required=False)
+        parser.add_argument("--raw_metadata", type=str, required=False)
         parser.add_argument("--train_resolution", type=str, required=True)
         parser.add_argument("--report_to", type=str, required=True)
 
@@ -209,7 +231,14 @@ class Args(BaseModel):
         # Data loading
         parser.add_argument("--num_workers", type=int, default=8)
         parser.add_argument("--pin_memory", type=bool, default=True)
+        parser.add_argument("--xyz_loss_weight", type=float, default=1.0)
         parser.add_argument("--image_column", type=str, default=None)
+        parser.add_argument("--raw_data", action="store_true")
+        parser.add_argument("--dummy_data", action="store_true")
+        parser.add_argument("--dummy_num_samples", type=int, default=8)
+        parser.add_argument("--use_xyz_first_frame", action="store_true")
+        parser.add_argument("--log_data_paths", action="store_true")
+        parser.add_argument("--log_data_paths_limit", type=int, default=10)
 
         # Model configuration
         parser.add_argument("--mixed_precision", type=str, default="no")
@@ -227,17 +256,46 @@ class Args(BaseModel):
         parser.add_argument("--checkpointing_steps", type=int, default=200)
         parser.add_argument("--checkpointing_limit", type=int, default=10)
         parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+        parser.add_argument("--init_lora_path", type=str, default=None)
 
         # Validation
         parser.add_argument("--do_validation", type=lambda x: x.lower() == 'true', default=False)
+        parser.add_argument("--checkpoint_validation", action="store_true")
         parser.add_argument("--validation_steps", type=int, default=None)
         parser.add_argument("--validation_dir", type=str, default=None)
         parser.add_argument("--validation_prompts", type=str, default=None)
         parser.add_argument("--validation_images", type=str, default=None)
         parser.add_argument("--validation_videos", type=str, default=None)
+        parser.add_argument("--validation_xyz_images", type=str, default=None)
         parser.add_argument("--gen_fps", type=int, default=15)
 
         args = parser.parse_args()
+        if not args.dummy_data:
+            if args.raw_data and args.raw_metadata is None:
+                required = ("data_root", "caption_column", "video_column", "pointmap_column")
+            elif args.raw_data and args.raw_metadata is not None:
+                required = ()
+            else:
+                required = ("data_root", "caption_column", "video_column")
+            missing = [arg_name for arg_name in required if getattr(args, arg_name) is None]
+            if missing:
+                parser.error(f"Missing required arguments: {', '.join(missing)} (unless --dummy_data is set)")
+        else:
+            if args.data_root is None:
+                args.data_root = "."
+            if args.caption_column is None:
+                args.caption_column = "prompts.txt"
+            if args.video_column is None:
+                args.video_column = "videos.txt"
+        if args.raw_data and args.raw_metadata is not None:
+            if args.data_root is None:
+                args.data_root = "."
+            if args.caption_column is None:
+                args.caption_column = "prompts.txt"
+            if args.video_column is None:
+                args.video_column = "videos.txt"
+            if args.pointmap_column is None:
+                args.pointmap_column = "pointmap_videos.txt"
 
         # Convert video_resolution_buckets string to list of tuples
         frames, height, width = args.train_resolution.split("x")

@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -18,6 +19,7 @@ from core.finetune.schemas import Wan_Components as Components
 from core.finetune.trainer import Trainer
 from core.finetune.utils import unwrap_model
 from core.finetune.models.wan_i2v.sft_trainer import generate_uniform_pointmap, retrieve_latents
+from core.finetune.constants import ENCODED_PM_MEAN, ENCODED_PM_STD
 
 from ..utils import register
 from diffusers.utils.torch_utils import randn_tensor
@@ -30,7 +32,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from diffusers.configuration_utils import register_to_config
-from diffusers.utils import USE_PEFT_BACKEND, logging, scale_lora_layers, unscale_lora_layers
+from diffusers.utils import USE_PEFT_BACKEND, load_image, logging, scale_lora_layers, unscale_lora_layers
 from diffusers.models.attention import FeedForward
 from diffusers.models.attention_processor import Attention
 from diffusers.models.embeddings import get_1d_rotary_pos_embed
@@ -470,6 +472,7 @@ class WanSameRopeWBWImageToVideoPipeline(WanImageToVideoPipeline):
         scheduler: FlowMatchEulerDiscreteScheduler,
     ):
         super().__init__(tokenizer, text_encoder, image_encoder, image_processor, transformer, vae, scheduler)
+        self.pointmap_mask_value = 1.0
 
     @override
     def prepare_latents(
@@ -503,8 +506,21 @@ class WanSameRopeWBWImageToVideoPipeline(WanImageToVideoPipeline):
             latents = latents.to(device=device, dtype=dtype)
 
         image = image.unsqueeze(2)
-        pointmap = generate_uniform_pointmap(height, width)
-        pointmap = torch.from_numpy(pointmap).to(device=device, dtype=dtype).permute(2, 0, 1)[None, :, None, :, :] * 2 - 1
+        pointmap_image = getattr(self, "pointmap_image", None)
+        if pointmap_image is not None:
+            # pointmap_image is already normalized to [-1, 1] by VideoProcessor
+            if pointmap_image.ndim == 3:
+                pointmap_image = pointmap_image.unsqueeze(0)
+            pointmap = pointmap_image.to(device=device, dtype=dtype).unsqueeze(2)
+        else:
+            pointmap = generate_uniform_pointmap(height, width)
+            pointmap = (
+                torch.from_numpy(pointmap)
+                .to(device=device, dtype=dtype)
+                .permute(2, 0, 1)[None, :, None, :, :]
+                * 2
+                - 1
+            )
         image = torch.concat([image, pointmap], dim=4)
         if last_image is None:
             video_condition = torch.cat(
@@ -538,6 +554,11 @@ class WanSameRopeWBWImageToVideoPipeline(WanImageToVideoPipeline):
 
         latent_condition = latent_condition.to(dtype)
         latent_condition = (latent_condition - latents_mean) * latents_std
+        pm_mean = torch.tensor(ENCODED_PM_MEAN, device=latent_condition.device, dtype=latent_condition.dtype)
+        pm_std = torch.tensor(ENCODED_PM_STD, device=latent_condition.device, dtype=latent_condition.dtype)
+        latent_condition[..., latent_condition.shape[4] // 2 :] = (
+            (latent_condition[..., latent_condition.shape[4] // 2 :] - pm_mean) / pm_std
+        )
 
         mask_lat_size = torch.ones(batch_size, 1, num_frames, latent_height, latent_width)
 
@@ -546,7 +567,8 @@ class WanSameRopeWBWImageToVideoPipeline(WanImageToVideoPipeline):
         else:
             mask_lat_size[:, :, list(range(1, num_frames - 1))] = 0
         first_frame_mask = mask_lat_size[:, :, 0:1]
-        first_frame_mask[:, :, :, :, latent_condition.shape[4]//2:] = 0.5
+        mask_value = float(getattr(self, "pointmap_mask_value", 1.0))
+        first_frame_mask[:, :, :, :, latent_condition.shape[4]//2:] = mask_value
         first_frame_mask = torch.repeat_interleave(first_frame_mask, dim=2, repeats=self.vae_scale_factor_temporal)
         mask_lat_size = torch.concat([first_frame_mask, mask_lat_size[:, :, 1:, :]], dim=2)
         mask_lat_size = mask_lat_size.view(batch_size, -1, self.vae_scale_factor_temporal, latent_height, latent_width)
@@ -587,7 +609,7 @@ class WanI2VDembSameRopeTrainer(Trainer):
 
     @override
     def initialize_pipeline(self) -> WanImageToVideoPipeline:
-        pipe = WanImageToVideoPipeline(
+        pipe = WanSameRopeWBWImageToVideoPipeline(
             tokenizer=self.components.tokenizer,
             text_encoder=self.components.text_encoder,
             vae=self.components.vae,
@@ -631,6 +653,12 @@ class WanI2VDembSameRopeTrainer(Trainer):
         prompt_embedding = self.components.text_encoder(prompt_token_ids.to(self.accelerator.device))[0]
         return prompt_embedding
 
+    def encode_image(self, image: Image.Image) -> torch.Tensor:
+        image_inputs = self.components.image_processor(images=image, return_tensors="pt").to(self.accelerator.device)
+        with torch.no_grad():
+            image_embeds = self.components.image_encoder(**image_inputs, output_hidden_states=True)
+        return image_embeds.hidden_states[-2]
+
     @override
     def collate_fn(self, samples: List[Dict[str, Any]]) -> Dict[str, Any]:
         ret = {"encoded_videos": [], "prompt_embedding": [], "images": [], "image_embedding": []}
@@ -664,10 +692,11 @@ class WanI2VDembSameRopeTrainer(Trainer):
 
     @override
     def compute_loss(self, batch) -> torch.Tensor:
-        prompt_embedding = batch["prompt_embedding"].to(self.components.transformer.dtype)
-        latent = batch["encoded_videos"].to(self.components.transformer.dtype)
+        transformer_dtype = self.get_transformer_dtype()
+        prompt_embedding = batch["prompt_embedding"].to(transformer_dtype)
+        latent = batch["encoded_videos"].to(transformer_dtype)
         images = batch["images"]
-        image_embedding = batch["image_embedding"].to(self.components.transformer.dtype)
+        image_embedding = batch["image_embedding"].to(transformer_dtype)
         # Shape of prompt_embedding: [B, seq_len, hidden_size] -> [B, 512, 4096]
         # Shape of latent: [B, C, F, H, W] -> [B, 16, 21 (if 81 frames), latent_H, latent_W]
         # Shape of images: [B, C, H, W]
@@ -685,12 +714,17 @@ class WanI2VDembSameRopeTrainer(Trainer):
         video_condition = torch.cat([images, images.new_zeros(images.shape[0], images.shape[1], num_real_frames - 1, images.shape[3], images.shape[4])], dim=2)
         with torch.no_grad():
             latent_condition = self.encode_video(video_condition)
+        pm_mean = torch.tensor(ENCODED_PM_MEAN, device=latent_condition.device, dtype=latent_condition.dtype)
+        pm_std = torch.tensor(ENCODED_PM_STD, device=latent_condition.device, dtype=latent_condition.dtype)
+        latent_condition[..., latent_condition.shape[4] // 2 :] = (
+            (latent_condition[..., latent_condition.shape[4] // 2 :] - pm_mean) / pm_std
+        )
 
         mask_lat_size = torch.ones(latent_condition.shape[0], 1, num_real_frames, latent_condition.shape[3], latent_condition.shape[4])
         mask_lat_size[:, :, list(range(1, num_real_frames))] = 0
         first_frame_mask = mask_lat_size[:, :, 0:1]
         # add special mask value for another modality - pointmap
-        first_frame_mask[:, :, :, :, latent_condition.shape[4]//2:] = 0.5
+        first_frame_mask[:, :, :, :, latent_condition.shape[4]//2:] = 1.0
         first_frame_mask = torch.repeat_interleave(first_frame_mask, dim=2, repeats=vae_scale_factor_temporal)
         mask_lat_size = torch.concat([first_frame_mask, mask_lat_size[:, :, 1:, :]], dim=2)
         mask_lat_size = mask_lat_size.view(batch_size, -1, vae_scale_factor_temporal, latent_condition.shape[-2], latent_condition.shape[-1])
@@ -718,9 +752,44 @@ class WanI2VDembSameRopeTrainer(Trainer):
             return_dict=False,
         )[0]
 
-        loss = torch.mean(((predicted_noise.float() - target.float()) ** 2).reshape(batch_size, -1), dim=1)
+        diff = predicted_noise.float() - target.float()
+        diff_sq = diff * diff
+        if self.args.xyz_loss_weight != 1.0:
+            right_start = diff_sq.shape[4] // 2
+            diff_sq[..., right_start:] = diff_sq[..., right_start:] * self.args.xyz_loss_weight
+        loss = torch.mean(diff_sq.reshape(batch_size, -1), dim=1)
         loss = loss.mean()
 
         return loss
+
+    @override
+    def validation_step(
+        self, eval_data: Dict[str, Any], pipe: WanImageToVideoPipeline
+    ) -> List[Tuple[str, Image.Image | List[Image.Image]]]:
+        prompt = eval_data["prompt"]
+        image = eval_data["image"]
+        xyz_image = eval_data.get("xyz_image", None)
+
+        if xyz_image is not None and hasattr(pipe, "video_processor"):
+            if isinstance(xyz_image, Path):
+                xyz_image = str(xyz_image)
+            pointmap_image = load_image(xyz_image)
+            pointmap_image = pointmap_image.resize((self.state.train_width, self.state.train_height))
+            pointmap_tensor = pipe.video_processor.preprocess(
+                pointmap_image, height=self.state.train_height, width=self.state.train_width
+            )
+            setattr(pipe, "pointmap_image", pointmap_tensor)
+        elif hasattr(pipe, "pointmap_image"):
+            setattr(pipe, "pointmap_image", None)
+
+        video_generate = pipe(
+            num_frames=self.state.train_frames,
+            height=self.state.train_height,
+            width=self.state.train_width,
+            prompt=prompt,
+            image=image,
+            generator=self.state.generator,
+        ).frames[0]
+        return [("video", video_generate)]
 
 register("wan-i2v-demb-samerope", "lora", WanI2VDembSameRopeTrainer)

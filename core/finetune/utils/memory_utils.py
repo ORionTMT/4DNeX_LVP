@@ -1,5 +1,5 @@
 import gc
-from typing import Any, Dict, Union
+from typing import Any, Dict, Optional, Union
 
 import torch
 from accelerate.logging import get_logger
@@ -29,17 +29,29 @@ def get_memory_statistics(precision: int = 3) -> Dict[str, Any]:
     else:
         logger.warning("No CUDA, MPS, or ROCm device found. Memory statistics are not available.")
 
+    memory_allocated_gb = bytes_to_gigabytes(memory_allocated)
+    memory_reserved_gb = bytes_to_gigabytes(memory_reserved)
+    max_memory_allocated_gb = bytes_to_gigabytes(max_memory_allocated)
+    max_memory_reserved_gb = bytes_to_gigabytes(max_memory_reserved)
+
     return {
-        "memory_allocated": round(bytes_to_gigabytes(memory_allocated), ndigits=precision),
-        "memory_reserved": round(bytes_to_gigabytes(memory_reserved), ndigits=precision),
-        "max_memory_allocated": round(bytes_to_gigabytes(max_memory_allocated), ndigits=precision),
-        "max_memory_reserved": round(bytes_to_gigabytes(max_memory_reserved), ndigits=precision),
+        "memory_allocated": round_or_none(memory_allocated_gb, precision),
+        "memory_reserved": round_or_none(memory_reserved_gb, precision),
+        "max_memory_allocated": round_or_none(max_memory_allocated_gb, precision),
+        "max_memory_reserved": round_or_none(max_memory_reserved_gb, precision),
     }
 
 
-def bytes_to_gigabytes(x: int) -> float:
-    if x is not None:
-        return x / 1024**3
+def bytes_to_gigabytes(x: Optional[int]) -> Optional[float]:
+    if x is None:
+        return None
+    return x / 1024**3
+
+
+def round_or_none(value: Optional[float], precision: int) -> Optional[float]:
+    if value is None:
+        return None
+    return round(value, ndigits=precision)
 
 
 def free_memory() -> None:

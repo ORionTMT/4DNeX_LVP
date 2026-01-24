@@ -31,3 +31,9 @@ diffusers/
 results/
 output*/
 log*
+
+training/
+pretrained/
+data/
+results/
+slurm_logs/
