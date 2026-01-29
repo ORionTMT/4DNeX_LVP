@@ -183,6 +183,59 @@ To launch training, we assume all data are in the `./data/wan21` directory, and 
 bash scripts/finetune.sh
 ```
 
+## 🧭 Local Notes (This Fork)
+
+This repo has additional training/inference scripts and options for the Wan I2V + pointmap setup. The commands below reflect the current workflow used in this codebase.
+
+### Inference (RGB + XYZ side-by-side, 960x480)
+Use `inference.py` (wraps `core/inference/wan.py`) to generate an RGB+XYZ video and optional pointmap outputs:
+```bash
+python inference.py \
+  --prompt results/infer_inputs/prompt.txt \
+  --image results/infer_inputs/image.txt \
+  --xyz_image results/infer_inputs/xyz_image.txt \
+  --model_path pretrained/Wan2.1-I2V-14B-480P-Diffusers-lvp-original \
+  --lora_path pretrained/4dnex-lora \
+  --type i2vwbw-demb-samerope \
+  --mode xyzrgb \
+  --out results/infer_outputs
+```
+Notes:
+- This path decodes from latents and applies pointmap denormalization before decoding.
+- Output is 960x480 (left RGB, right XYZ visualization).
+
+### Validation-like single-sample inference
+`scripts/infer_validation_sample.py` mirrors the validation pipeline used during training and is useful for debugging:
+```bash
+python scripts/infer_validation_sample.py \
+  --base_model pretrained/Wan2.1-I2V-14B-480P-Diffusers-lvp-original \
+  --lora_path training/4dnex-lvp/checkpoint-XXXX \
+  --line_index 2 \
+  --output results/infer_outputs/validation_line2.mp4 \
+  --domain_embedding_scale 1.0 \
+  --lora_scale 1.0
+```
+Optional flags:
+- `--denorm_pointmap` to match the `inference.py` latent denorm + decode path (outputs 960x480).
+- `--vae_tiling`, `--vae_slicing`, `--offload_after_latents` for low-VRAM decode.
+
+### Training (LVP-based finetuning)
+We keep two Slurm launchers:
+- `train_4dnex.sh`: original 4DNeX recipe
+- `train_4dnex_lvp.sh`: LVP-based finetuning (LoRA + domain embeddings)
+
+Typical LVP run:
+```bash
+bash train_4dnex_lvp.sh
+```
+Key flags in `train_4dnex_lvp.sh`:
+- `--model_path`: base diffusers checkpoint (e.g. `pretrained/Wan2.1-I2V-14B-480P-Diffusers-lvp-original`)
+- `--training_type lora` and LoRA rank/alpha (see `core/finetune/schemas/args.py`)
+- `--init_domain_embeddings_path`: initialize learnable domain embeddings
+- `--domain_embedding_scale`: scales domain embeddings in forward
+- `--lr_scheduler cosine` with `configs_acc/8gpu_cosine.yaml` (WarmupCosineLR)
+
+
 ### Convert Zero Checkpoint to FP32
 After training, you may convert the zero checkpoint to fp32 checkpoint for inference. For example, the output will be saved in the `./training/4dnex/5000-out` directory as follows:
 ```bash

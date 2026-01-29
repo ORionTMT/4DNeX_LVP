@@ -311,6 +311,7 @@ class WanTransformer3DModelDembSameRope(WanTransformer3DModel, ModelMixin):
         added_kv_proj_dim: Optional[int] = None,
         rope_max_seq_len: int = 1024,
         pos_embed_seq_len: Optional[int] = None,
+        domain_embedding_scale: float = 1.0,
     ) -> None:
         super().__init__(
             patch_size=patch_size,
@@ -347,6 +348,7 @@ class WanTransformer3DModelDembSameRope(WanTransformer3DModel, ModelMixin):
             ]
         )
         self.learnable_domain_embeddings = nn.Parameter(torch.zeros(2, inner_dim))
+        self.domain_embedding_scale = float(domain_embedding_scale)
 
     def forward(
         self,
@@ -383,7 +385,17 @@ class WanTransformer3DModelDembSameRope(WanTransformer3DModel, ModelMixin):
         hidden_states = self.patch_embedding(hidden_states)
         # assume modality concat along width
         first_half_domain_emb, second_half_domain_emb = self.learnable_domain_embeddings.chunk(2, dim=0)
-        hidden_states = torch.cat([hidden_states[:, :, :, :, :post_patch_width//2] + first_half_domain_emb[..., None, None, None], hidden_states[:, :, :, :, post_patch_width//2:] + second_half_domain_emb[..., None, None, None]], dim=4)
+        domain_embedding_scale = getattr(self, "domain_embedding_scale", 1.0)
+        if domain_embedding_scale != 1.0:
+            first_half_domain_emb = first_half_domain_emb * domain_embedding_scale
+            second_half_domain_emb = second_half_domain_emb * domain_embedding_scale
+        hidden_states = torch.cat(
+            [
+                hidden_states[:, :, :, :, :post_patch_width//2] + first_half_domain_emb[..., None, None, None],
+                hidden_states[:, :, :, :, post_patch_width//2:] + second_half_domain_emb[..., None, None, None],
+            ],
+            dim=4,
+        )
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
@@ -592,6 +604,12 @@ class WanI2VDembSameRopeTrainer(Trainer):
         components.text_encoder = UMT5EncoderModel.from_pretrained(model_path, subfolder="text_encoder")
 
         components.transformer = WanTransformer3DModelDembSameRope.from_pretrained(model_path, subfolder="transformer")
+        if self.args.domain_embedding_scale is not None:
+            scale = float(self.args.domain_embedding_scale)
+            components.transformer.domain_embedding_scale = scale
+            if hasattr(components.transformer, "register_to_config"):
+                components.transformer.register_to_config(domain_embedding_scale=scale)
+            logger.info(f"Set domain_embedding_scale to {scale}")
 
         components.vae = AutoencoderKLWan.from_pretrained(model_path, subfolder="vae")
 

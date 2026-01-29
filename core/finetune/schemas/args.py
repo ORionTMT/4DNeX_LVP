@@ -36,6 +36,8 @@ class Args(BaseModel):
     ########## Training #########
     resume_from_checkpoint: Path | None = None
     init_lora_path: Path | None = None
+    domain_embedding_scale: float | None = None
+    init_domain_embeddings_path: Path | None = None
 
     seed: int | None = None
     train_epochs: int
@@ -58,7 +60,7 @@ class Args(BaseModel):
 
     mixed_precision: Literal["no", "fp16", "bf16"]
 
-    learning_rate: float = 2e-5
+    learning_rate: float = 5e-4
     optimizer: str = "adamw"
     beta1: float = 0.9
     beta2: float = 0.95
@@ -257,6 +259,8 @@ class Args(BaseModel):
         parser.add_argument("--checkpointing_limit", type=int, default=10)
         parser.add_argument("--resume_from_checkpoint", type=str, default=None)
         parser.add_argument("--init_lora_path", type=str, default=None)
+        parser.add_argument("--domain_embedding_scale", type=float, default=None)
+        parser.add_argument("--init_domain_embeddings_path", type=str, default=None)
 
         # Validation
         parser.add_argument("--do_validation", type=lambda x: x.lower() == 'true', default=False)

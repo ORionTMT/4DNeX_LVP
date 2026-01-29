@@ -280,6 +280,19 @@ class Trainer:
                     param.requires_grad_(True)
                     logger.info(f"Training {name} after adding LoRA")
 
+        if self.args.init_domain_embeddings_path:
+            init_path = Path(self.args.init_domain_embeddings_path)
+            if init_path.is_dir():
+                init_path = init_path / "learnable_domain_embeddings.pt"
+            if init_path.exists():
+                learnable_embeddings = torch.load(init_path, map_location="cpu")
+                param = getattr(self.components.transformer, "learnable_domain_embeddings", None)
+                if param is not None:
+                    param.data = learnable_embeddings.to(param.device, param.dtype)
+                    logger.info(f"Loaded learnable_domain_embeddings from {init_path}")
+            else:
+                logger.warning(f"init_domain_embeddings_path not found: {init_path}")
+
         # Load components needed for training to GPU (except transformer), and cast them to the specified data type
         ignore_list = ["transformer"] + self.UNLOAD_LIST
         if self.args.raw_data:

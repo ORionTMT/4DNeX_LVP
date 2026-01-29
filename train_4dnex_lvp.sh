@@ -2,12 +2,12 @@
 #SBATCH -J 4dnex_lvp_train
 #SBATCH -o slurm_logs/4dnex_lvp_train_%j.out
 #SBATCH -e slurm_logs/4dnex_lvp_train_%j.err
-#SBATCH --gres=gpu:8
+#SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=8
 #SBATCH --time=72:00:00
 #SBATCH --mem=512G
 #SBATCH --partition=dgx-b200
-#SBATCH --ntasks-per-node=8
+#SBATCH --ntasks-per-node=4
  
 source ~/.bashrc
 source /vast/projects/jgu32/lab/mutian/miniconda3/etc/profile.d/conda.sh
@@ -19,23 +19,22 @@ export CUDA_HOME=$(dirname $(dirname $(readlink -f $(which nvcc))))
 export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
 /vast/projects/jgu32/lab/mutian/miniconda3/envs/4dnex/bin/accelerate launch \
   --config_file configs_acc/8gpu.yaml \
-  --num_processes 8 \
+  --num_processes 4\
   finetune.py \
-  --model_path ./pretrained/Wan2.1-I2V-14B-480P-Diffusers-lvp \
+  --model_path ./pretrained/Wan2.1-I2V-14B-480P-Diffusers-lvp-tuned \
   --model_name wan-i2v-demb-samerope \
   --model_type wan-i2v \
   --training_type lora \
-  --output_dir training/4dnex-lvp-5TimesWeight_continued \
-  --resume_from_checkpoint training/holdout/checkpoint-2300 \
+  --output_dir training/fromTuned_5e4_constant \
   --report_to tensorboard \
   --raw_data \
   --raw_metadata data/lvp/meta.json \
   --data_root data/lvp \
   --train_resolution 49x480x480 \
-  --train_steps 10000 \
+  --train_steps 1000 \
   --batch_size 4 \
   --gradient_accumulation_steps 1 \
   --mixed_precision bf16 \
@@ -45,11 +44,15 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   --use_xyz_first_frame \
   --log_data_paths \
   --log_data_paths_limit 20 \
-  --xyz_loss_weight 5.0 \
+  --xyz_loss_weight 2.0 \
   --checkpoint_validation \
   --validation_dir results/infer_inputs \
   --validation_prompts prompt.txt \
   --validation_images image.txt \
-  --validation_xyz_images xyz_image.txt
-
+  --init_domain_embeddings_path pretrained/4dnex-lora/learnable_domain_embeddings.pt \
+  --domain_embedding_scale 1.0 \
+  --validation_xyz_images xyz_image.txt \
+  --learning_rate 2e-4 \
+  --lr_scheduler constant_with_warmup\
+  --lr_warmup_steps 0
 
